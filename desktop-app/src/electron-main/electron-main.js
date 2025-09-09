@@ -333,8 +333,75 @@ function pruneMousePosHistory() {
 
 /** @type {BrowserWindow} */
 let appWindow;
-/** @type {BrowserWindow} */
-let screenOverlayWindow;
+/** @type {BrowserWindow[]} */
+let screenOverlayWindows = [];
+let virtualScreenBounds = { x: 0, y: 0, width: 0, height: 0 };
+
+const createScreenOverlayWindows = (screen) => {
+	// Destroy existing windows
+	for (const win of screenOverlayWindows) {
+		try {
+			win.destroy();
+		} catch { /* ignore */ }
+	}
+	screenOverlayWindows = [];
+
+	const displays = screen.getAllDisplays();
+	const boundsArray = displays.map(d => d.bounds);
+	const minX = Math.min(...boundsArray.map(b => b.x));
+	const minY = Math.min(...boundsArray.map(b => b.y));
+	const maxX = Math.max(...boundsArray.map(b => b.x + b.width));
+	const maxY = Math.max(...boundsArray.map(b => b.y + b.height));
+	virtualScreenBounds = { x: minX, y: minY, width: maxX - minX, height: maxY - minY };
+
+	for (const display of displays) {
+		const win = new BrowserWindow({
+			fullscreen: true, // needed on Windows 11
+			x: display.bounds.x,
+			y: display.bounds.y,
+			width: display.bounds.width,
+			height: display.bounds.height,
+			frame: false,
+			transparent: true,
+			backgroundColor: '#00000000',
+			hasShadow: false,
+			roundedCorners: false,
+			alwaysOnTop: true,
+			resizable: false,
+			movable: false,
+			minimizable: false,
+			maximizable: false,
+			closable: false,
+			focusable: false,
+			skipTaskbar: true,
+			accessibleTitle: 'Tracky Mouse Screen Overlay',
+			webPreferences: {
+				preload: path.join(app.getAppPath(), 'src/preload-screen-overlay.js'),
+			},
+		});
+		win.setIgnoreMouseEvents(true);
+		win.setAlwaysOnTop(true, 'screen-saver');
+
+		win.loadFile(`src/electron-screen-overlay.html`);
+		win.on('close', (event) => {
+			event.preventDefault();
+			win.setSkipTaskbar(true);
+			win.setClosable(false);
+			win.setFullScreen(true);
+			win.setIgnoreMouseEvents(true);
+			win.setAlwaysOnTop(true, 'screen-saver');
+			win.hide();
+			win.show();
+		});
+		win.on('closed', () => {
+			const idx = screenOverlayWindows.indexOf(win);
+			if (idx > -1) {
+				screenOverlayWindows.splice(idx, 1);
+			}
+		});
+		screenOverlayWindows.push(win);
+	}
+};
 
 const createWindow = () => {
 	const appWindowState = windowStateKeeper({
@@ -400,12 +467,14 @@ const createWindow = () => {
 	let regainControlTimeout = null; // also used to check if we're pausing temporarily
 	let cameraFeedDiagnostics = {};
 	const updateDwellClicking = () => {
-		screenOverlayWindow.webContents.send(
-			'change-dwell-clicking',
-			enabled && regainControlTimeout === null,
-			enabled && regainControlTimeout !== null,
-			cameraFeedDiagnostics,
-		);
+		for (const win of screenOverlayWindows) {
+			win.webContents.send(
+				'change-dwell-clicking',
+				enabled && regainControlTimeout === null,
+				enabled && regainControlTimeout !== null,
+				cameraFeedDiagnostics,
+			);
+		}
 	};
 	ipcMain.on('move-mouse', async (_event, x, y, time) => {
 		// TODO: consider postponing getMouseLocation, if possible, to minimize latency,
@@ -449,7 +518,10 @@ const createWindow = () => {
 		// const latency = performance.now() - time;
 		// console.log(`move-mouse: (${x}, ${y}), latency: ${latency}, distanceMoved: ${distanceMoved}, curPos: (${curPos.x}, ${curPos.y}), lastPos: (${lastPos.x}, ${lastPos.y})`);
 
-		screenOverlayWindow.webContents.send('move-mouse', x, y, time);
+		for (const win of screenOverlayWindows) {
+			const bounds = win.getContentBounds();
+			win.webContents.send('move-mouse', x - bounds.x, y - bounds.y, time);
+		}
 	});
 
 	ipcMain.on('notify-toggle-state', async (_event, nowEnabled) => {
@@ -488,25 +560,23 @@ const createWindow = () => {
 		return app.isPackaged;
 	});
 
-	ipcMain.on('click', async (_event, x, y, _time) => {
+	ipcMain.handle('get-virtual-screen-bounds', async () => {
+		return virtualScreenBounds;
+	});
+
+	ipcMain.on('click', async (event, x, y, _time) => {
 		if (regainControlTimeout || !enabled) {
 			return;
 		}
 
-		// Failsafe: don't click if the window(s) are closed.
-		// This helps with debugging the closing/quitting behavior.
-		// It would also help to have a heartbeat to avoid clicking while paused in the debugger in other scenarios,
-		// and avoid the dwell clicking indicator from repeatedly showing while there's no connectivity between the processes.
-		if (
-			(!screenOverlayWindow || screenOverlayWindow.isDestroyed()) ||
-			(!appWindow || appWindow.isDestroyed())
-		) {
+		const senderWindow = BrowserWindow.fromWebContents(event.sender);
+		if (!senderWindow || senderWindow.isDestroyed() || !appWindow || appWindow.isDestroyed()) {
 			return;
 		}
 
-		// Translate coords in case of debug (doesn't matter when it's fullscreen).
-		x += screenOverlayWindow.getContentBounds().x;
-		y += screenOverlayWindow.getContentBounds().y;
+		const bounds = senderWindow.getContentBounds();
+		x += bounds.x;
+		y += bounds.y;
 
 		await setMouseLocationTracky(x, y);
 		await click(swapMouseButtons ? "right" : "left");
@@ -515,61 +585,24 @@ const createWindow = () => {
 		// console.log(`click: ${x}, ${y}, latency: ${latency}`);
 	});
 
-	// Set up the screen overlay window.
+	// Set up the screen overlay windows.
 	// We cannot require the screen module until the app is ready.
 	const { screen } = require('electron');
-	const primaryDisplay = screen.getPrimaryDisplay();
-	screenOverlayWindow = new BrowserWindow({
-		fullscreen: true, // needed on Windows 11, since it seems to constrain the size to the work area otherwise
-		x: primaryDisplay.bounds.x,
-		y: primaryDisplay.bounds.y,
-		width: primaryDisplay.bounds.width,
-		height: primaryDisplay.bounds.height,
-		frame: false,
-		transparent: true,
-		backgroundColor: '#00000000',
-		hasShadow: false,
-		roundedCorners: false,
-		alwaysOnTop: true,
-		resizable: false,
-		movable: false,
-		minimizable: false,
-		maximizable: false,
-		closable: false,
-		focusable: false,
-		skipTaskbar: true,
-		accessibleTitle: 'Tracky Mouse Screen Overlay',
-		webPreferences: {
-			preload: path.join(app.getAppPath(), 'src/preload-screen-overlay.js'),
-		},
-	});
-	screenOverlayWindow.setIgnoreMouseEvents(true);
-	screenOverlayWindow.setAlwaysOnTop(true, 'screen-saver');
+	createScreenOverlayWindows(screen);
+	updateDwellClicking();
 
-	screenOverlayWindow.loadFile(`src/electron-screen-overlay.html`);
-	screenOverlayWindow.on('close', (event) => {
-		// If Windows Explorer is restarted while the app is running,
-		// the Screen Overlay Window can appear in the taskbar, and become closable.
-		// Various window attributes are forgotten, so we need to reset them.
-		// A more proactive approach of restoring skipTaskbar when Windows Explorer is restarted would be better.
-		// See: https://github.com/1j01/tracky-mouse/issues/47
-		// And: https://github.com/electron/electron/issues/29526
-		event.preventDefault();
-		screenOverlayWindow.setSkipTaskbar(true);
-		screenOverlayWindow.setClosable(false);
-		screenOverlayWindow.setFullScreen(true);
-		screenOverlayWindow.setIgnoreMouseEvents(true);
-		// "screen-saver" is the highest level; it should show above the taskbar.
-		screenOverlayWindow.setAlwaysOnTop(true, 'screen-saver');
-		// The window isn't showing on top of the taskbar without this.
-		screenOverlayWindow.hide();
-		screenOverlayWindow.show();
+	screen.on('display-added', () => {
+		createScreenOverlayWindows(screen);
+		updateDwellClicking();
 	});
-	screenOverlayWindow.on('closed', () => {
-		screenOverlayWindow = null;
+	screen.on('display-removed', () => {
+		createScreenOverlayWindows(screen);
+		updateDwellClicking();
 	});
-
-	// screenOverlayWindow.webContents.openDevTools({ mode: 'detach' });
+	screen.on('display-metrics-changed', () => {
+		createScreenOverlayWindows(screen);
+		updateDwellClicking();
+	});
 };
 
 // This method will be called when Electron has finished
