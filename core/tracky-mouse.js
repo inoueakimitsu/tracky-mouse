@@ -727,6 +727,18 @@ TrackyMouse.init = function (div, { statsJs = false } = {}) {
 	var maxPoints = 1000;
 	var mouseX = 0;
 	var mouseY = 0;
+	var screenWidth = innerWidth;
+	var screenHeight = innerHeight;
+	var offsetX = 0;
+	var offsetY = 0;
+	if (window.electronAPI && window.electronAPI.getVirtualScreenBounds) {
+		window.electronAPI.getVirtualScreenBounds().then((bounds) => {
+			screenWidth = bounds.width;
+			screenHeight = bounds.height;
+			offsetX = bounds.x;
+			offsetY = bounds.y;
+		});
+	}
 	var prevMovementX = 0;
 	var prevMovementY = 0;
 	var enableTimeTravel = false;
@@ -1715,9 +1727,6 @@ TrackyMouse.init = function (div, { statsJs = false } = {}) {
 			}
 
 			if (!paused) {
-				const screenWidth = window.electronAPI ? screen.width : innerWidth;
-				const screenHeight = window.electronAPI ? screen.height : innerHeight;
-
 				mouseX -= deltaX * screenWidth;
 				mouseY += deltaY * screenHeight;
 
@@ -1731,7 +1740,7 @@ TrackyMouse.init = function (div, { statsJs = false } = {}) {
 					mouseNeedsInitPos = false;
 				}
 				if (window.electronAPI) {
-					window.electronAPI.moveMouse(~~mouseX, ~~mouseY);
+					window.electronAPI.moveMouse(~~(mouseX + offsetX), ~~(mouseY + offsetY));
 					pointerEl.style.display = "none";
 				} else {
 					pointerEl.style.display = "";

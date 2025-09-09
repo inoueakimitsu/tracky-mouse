@@ -36,4 +36,5 @@ contextBridge.exposeInMainWorld("electronAPI", {
 	// isPackaged: app.isPackaged, // can't require electron's app module here
 	// isPackaged: !!process.defaultApp, // nope, doesn't exist
 	getIsPackaged: () => ipcRenderer.invoke('get-is-packaged'),
+	getVirtualScreenBounds: () => ipcRenderer.invoke('get-virtual-screen-bounds'),
 });
